@@ -92,11 +92,16 @@ BTC_DESC = ("비트코인의 장기 추세선입니다. 가격이 200일선 위�
 NETLIQ_DESC = ("Fed가 푼 돈에서 정부 통장과 Fed 주차장에 묶인 돈을 뺀 값입니다. "
                "실제 시장에 남아 있는 돈의 양을 보는 지표입니다.")
 
-# 차트 제목 (스펙 지정)
+# 차트 제목 (한글 별명 + 실제 지표명 병기)
 CHART_TITLES = {
-    "WALCL": "연준 돈 수도꼭지", "WTREGEN": "미국 정부 통장", "RRPONTSYD": "연준 돈 주차장",
-    "M2SL": "미국 돈의 총량", "DXY": "달러의 힘", "DGS10": "안전자산 이자율",
-    "BTC": "비트코인 장기 추세", "NETLIQ": "실제 시장 유동성",
+    "WALCL": "연준 돈 수도꼭지 (Fed Balance Sheet)",
+    "WTREGEN": "미국 정부 통장 (TGA)",
+    "RRPONTSYD": "연준 돈 주차장 (RRP)",
+    "M2SL": "미국 돈의 총량 (M2)",
+    "DXY": "달러의 힘 (DXY)",
+    "DGS10": "안전자산 이자율 (US 10Y)",
+    "BTC": "비트코인 장기 추세 (BTC + 200일선)",
+    "NETLIQ": "실제 시장 유동성 (Net Liquidity)",
 }
 
 
@@ -104,19 +109,33 @@ CHART_TITLES = {
 # 1) 데이터 수집 — FRED
 # ─────────────────────────────────────────────────────────────────────────────
 def _fred_via_csv(series_id: str, start: str) -> pd.Series:
-    """FRED 공개 CSV 엔드포인트 (API 키 불필요)."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}"
-    r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    date_col = df.columns[0]                       # DATE 또는 observation_date
-    val_col = df.columns[-1]
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")  # '.' → NaN
-    s = df.dropna(subset=[date_col]).set_index(date_col)[val_col].dropna()
-    s.index = s.index.tz_localize(None)
-    s.name = series_id
-    return s
+    """FRED 공개 CSV 엔드포인트 (API 키 불필요). 재시도 + 대체 URL."""
+    urls = [
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd={start}",
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; liquidity-dashboard/1.0)"}
+    last_err = None
+    for url in urls:
+        for _ in range(2):  # 가벼운 재시도
+            try:
+                r = requests.get(url, timeout=25, headers=headers)
+                r.raise_for_status()
+                df = pd.read_csv(io.StringIO(r.text))
+                date_col = df.columns[0]               # DATE 또는 observation_date
+                val_col = df.columns[-1]
+                df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+                df[val_col] = pd.to_numeric(df[val_col], errors="coerce")  # '.' → NaN
+                s = df.dropna(subset=[date_col]).set_index(date_col)[val_col].dropna()
+                s.index = s.index.tz_localize(None)
+                s.name = series_id
+                if not s.empty:
+                    return s
+            except Exception as e:
+                last_err = e
+    if last_err:
+        raise last_err
+    return pd.Series(dtype=float, name=series_id)
 
 
 def _fred_via_api(series_id: str, start: str, api_key: str) -> pd.Series:
@@ -400,16 +419,28 @@ def _base_layout(fig: go.Figure, title: str, ytitle: str = ""):
     return fig
 
 
+def _empty_fig(title: str) -> go.Figure:
+    """데이터가 없을 때 '데이터 없음'을 표시하는 빈 차트."""
+    fig = go.Figure()
+    fig.add_annotation(text="데이터 없음 (FRED 키 설정 또는 새로고침 필요)",
+                       xref="paper", yref="paper", x=0.5, y=0.5,
+                       showarrow=False, font=dict(size=13, color="#94a3b8"))
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    return _base_layout(fig, title)
+
+
 def plot_indicator_chart(s: pd.Series, title: str, period: str,
                         ytitle: str = "") -> go.Figure:
+    sp = _slice_period(s, period) if s is not None else pd.Series(dtype=float)
+    if sp is None or sp.dropna().empty:
+        return _empty_fig(title)
     fig = go.Figure()
-    sp = _slice_period(s, period)
-    if not sp.empty:
-        fig.add_trace(go.Scatter(
-            x=sp.index, y=sp.values, mode="lines",
-            line=dict(color=C_LINE, width=2),
-            fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
-        ))
+    fig.add_trace(go.Scatter(
+        x=sp.index, y=sp.values, mode="lines",
+        line=dict(color=C_LINE, width=2),
+        fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
+    ))
     return _base_layout(fig, title, ytitle)
 
 
@@ -427,14 +458,15 @@ def plot_btc_ma_chart(btc: pd.Series, ma: pd.Series, period: str) -> go.Figure:
 
 
 def plot_net_liquidity_chart(net: pd.Series, period: str) -> go.Figure:
+    sp = _slice_period(net, period) if net is not None else pd.Series(dtype=float)
+    if sp is None or sp.dropna().empty:
+        return _empty_fig(CHART_TITLES["NETLIQ"])
     fig = go.Figure()
-    sp = _slice_period(net, period)
-    if not sp.empty:
-        fig.add_trace(go.Scatter(
-            x=sp.index, y=sp.values / 1000.0, mode="lines",   # 십억→조
-            line=dict(color="#a78bfa", width=2),
-            fill="tozeroy", fillcolor="rgba(167,139,250,0.10)",
-        ))
+    fig.add_trace(go.Scatter(
+        x=sp.index, y=sp.values / 1000.0, mode="lines",   # 십억→조
+        line=dict(color="#a78bfa", width=2),
+        fill="tozeroy", fillcolor="rgba(167,139,250,0.10)",
+    ))
     return _base_layout(fig, CHART_TITLES["NETLIQ"], "조 달러 (Trillion)")
 
 
