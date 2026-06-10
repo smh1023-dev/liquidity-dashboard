@@ -611,7 +611,7 @@ ASSET_FACTORS = {
 }
 FACTOR_KR = {"liq": "유동성", "rate": "금리(완화)", "dollar": "달러(약세)", "trend": "200일선 추세"}
 ASSET_KR = {"BTC": "비트코인", "QQQ": "나스닥100(QQQ)", "SOXX": "반도체(SOXX)",
-            "GLD": "금(GLD)", "TLT": "장기채(TLT)"}
+            "GLD": "금(GLD)", "TLT": "장기채(TLT)", "CASH": "현금/MMF (Cash)"}
 
 
 def build_macro_factors(liq: dict, rates: dict, dxy_change: dict) -> dict:
@@ -694,7 +694,63 @@ def asset_signal(asset_key: str, factors: dict, trend_above: bool | None,
             "confidence": conf, "top3": top3, "view_3m": view_3m, "view_6m": view_6m}
 
 
-# ── (5) AI 매크로 브리핑 (데이터 기반 자동 작성) ────────────────────────────
+def cash_signal(risk_asset_signals: dict, dgs2_val: float | None,
+                weather: dict) -> dict:
+    """
+    현금/MMF 환경 시그널 (가격·200일선 없음).
+    현금은 위험자산의 '반대' + 단기금리 수준으로 매력도가 결정된다.
+      - 위험자산 평균 환경이 비우호적(Risk-Off)일수록 현금 우호
+      - 2년물 금리가 높을수록 현금 보유 수익(이자) 매력 가산
+    """
+    # 위험자산 평균 점수(현금 제외) → 반대 부호
+    vals = [s["score"] for k, s in risk_asset_signals.items() if k != "CASH"]
+    avg_risk = sum(vals) / len(vals) if vals else 0.0
+    f_riskoff = _clip(-avg_risk * 1.3)              # 위험자산 약세 = 현금 우호
+    # 단기금리: 4%를 중립, 5.5%↑ 만점. 0%면 -1
+    if dgs2_val is not None:
+        f_rate = _clip((dgs2_val - 4.0) / 1.5)
+    else:
+        f_rate = 0.0
+    score = 0.65 * f_riskoff + 0.35 * f_rate
+
+    if score >= 0.20:
+        stance, emoji, color = "우호적", "🟢", C_GREEN
+    elif score <= -0.20:
+        stance, emoji, color = "비우호적", "🔴", C_RED
+    else:
+        stance, emoji, color = "중립", "🟡", C_YELLOW
+
+    # 신뢰도: 두 요인이 같은 방향이면 높음
+    sig = [1 if f_riskoff > 0.05 else (-1 if f_riskoff < -0.05 else 0),
+           1 if f_rate > 0.05 else (-1 if f_rate < -0.05 else 0)]
+    nz = [x for x in sig if x != 0]
+    if nz and abs(sum(nz)) == len(nz) and len(nz) == 2:
+        conf = "높음"
+    elif nz:
+        conf = "중간"
+    else:
+        conf = "낮음"
+
+    # Top Drivers
+    top3 = []
+    top3.append("위험자산 약세(Risk-Off)" if f_riskoff > 0 else
+                "위험자산 강세(Risk-On)" if f_riskoff < 0 else "위험자산 중립")
+    rate_txt = f"단기금리 {dgs2_val:.2f}%" if dgs2_val is not None else "단기금리"
+    top3.append(f"{rate_txt} {'(이자 매력)' if f_rate > 0 else '(낮음)' if f_rate < 0 else ''}".strip())
+    top3.append(f"시장 날씨 {weather.get('label','—')}")
+
+    if stance == "우호적":
+        view_3m = "위험자산이 부담받는 국면 — 현금의 방어·대기 매력이 큰 구간."
+        view_6m = "금리가 유지되면 현금 보유 비용이 낮아 대기 자금으로 유리."
+    elif stance == "비우호적":
+        view_3m = "위험선호가 강한 국면 — 현금 보유의 기회비용이 큰 구간."
+        view_6m = "유동성 우호가 지속되면 현금보다 위험자산이 유리할 전망."
+    else:
+        view_3m = "뚜렷한 우열이 없는 중립 — 분산·관망에 무난한 구간."
+        view_6m = "금리·유동성 방향이 잡히면 현금 매력도 재평가될 전망."
+
+    return {"stance": stance, "emoji": emoji, "color": color, "score": score,
+            "confidence": conf, "top3": top3, "view_3m": view_3m, "view_6m": view_6m}
 def generate_briefing(liq: dict, rates: dict, cycle: dict,
                       changes: dict, breakdown: dict) -> str:
     """라이브 데이터를 읽어 한 문단의 거시 브리핑을 작성(규칙 기반)."""
@@ -929,6 +985,110 @@ def asset_preference_ranking(signals: dict) -> list:
                         "stance": sg["stance"], "color": sg["color"],
                         "score": sg["score"], "driver": sg["top3"][0] if sg["top3"] else "—"})
     return ranking
+
+
+# ── Model Allocation (거시환경 기준 모델 포트폴리오 · 투자자문 아님) ────────────
+# 위험자산 키(현금 제외)
+RISK_ASSETS = ["BTC", "QQQ", "SOXX", "GLD", "TLT"]
+
+# 모델별 파라미터
+#  cash_floor: 현금 최소 비중, cash_cap: 현금 최대 비중
+#  temp: 점수 민감도(클수록 우호 자산에 더 몰아줌)
+#  max_w: 위험자산 한 종목 최대 비중
+ALLOC_MODELS = {
+    "Conservative": {"kr": "보수형", "cash_floor": 0.30, "cash_cap": 0.70,
+                     "temp": 1.6, "max_w": 0.30,
+                     "desc": "현금 비중을 높게 유지하며 변동성을 낮추는 방어적 구성입니다."},
+    "Balanced":     {"kr": "균형형", "cash_floor": 0.10, "cash_cap": 0.55,
+                     "temp": 2.2, "max_w": 0.35,
+                     "desc": "현금과 위험자산의 균형을 맞춘 중도적 구성입니다."},
+    "Aggressive":   {"kr": "공격형", "cash_floor": 0.02, "cash_cap": 0.40,
+                     "temp": 3.0, "max_w": 0.45,
+                     "desc": "우호적인 위험자산에 더 적극적으로 배분하는 공격적 구성입니다."},
+}
+
+
+def _softmax(scores: dict, temp: float) -> dict:
+    import math
+    mx = max(scores.values())
+    exps = {k: math.exp(temp * (v - mx)) for k, v in scores.items()}
+    tot = sum(exps.values()) or 1.0
+    return {k: v / tot for k, v in exps.items()}
+
+
+def macro_allocation(signals: dict, model: str) -> dict:
+    """
+    환경 점수를 비중(%)으로 환산. 투자 추천이 아니라 환경 기반 상대 비중.
+      1) 위험자산 평균 환경으로 '현금 비중'을 먼저 결정(약세일수록 현금↑)
+      2) 남은 비중을 위험자산 점수 소프트맥스로 배분(우호적일수록↑)
+      3) 종목 상한(max_w) 적용 후 재정규화, 총합 100%
+    """
+    p = ALLOC_MODELS[model]
+    risk_scores = {k: signals[k]["score"] for k in RISK_ASSETS if k in signals}
+    if not risk_scores:
+        return {"weights": {}, "model": model}
+
+    avg = sum(risk_scores.values()) / len(risk_scores)   # -1~+1
+    # 현금 비중: 위험자산이 약세(-)일수록 floor→cap 쪽으로
+    t = _clip((avg + 1) / 2)                              # 0(약세)~1(강세)
+    cash_w = p["cash_cap"] - (p["cash_cap"] - p["cash_floor"]) * t
+    # 현금 자체 환경 점수가 매우 우호적이면 약간 가산
+    if "CASH" in signals:
+        cash_w += 0.10 * _clip(signals["CASH"]["score"])
+    cash_w = min(p["cash_cap"], max(p["cash_floor"], cash_w))
+
+    # 위험자산 비중 = (1 - cash) 을 소프트맥스로 분배
+    risk_budget = 1.0 - cash_w
+    dist = _softmax(risk_scores, p["temp"])
+    weights = {k: dist[k] * risk_budget for k in risk_scores}
+
+    # 종목 상한 적용 후 초과분을 다른 위험자산에 재분배
+    for _ in range(3):
+        over = {k: w - p["max_w"] for k, w in weights.items() if w > p["max_w"]}
+        if not over:
+            break
+        excess = sum(over.values())
+        for k in over:
+            weights[k] = p["max_w"]
+        under = {k: w for k, w in weights.items() if w < p["max_w"]}
+        ub = sum(under.values()) or 1.0
+        for k in under:
+            weights[k] += excess * (under[k] / ub)
+
+    weights["CASH"] = cash_w
+    # 반올림(정수%) 후 총합 100 보정
+    pct = {k: round(v * 100) for k, v in weights.items()}
+    diff = 100 - sum(pct.values())
+    if diff != 0:
+        # 가장 비중 큰 항목에서 보정
+        big = max(pct, key=pct.get)
+        pct[big] += diff
+    return {"weights": pct, "cash": pct["CASH"], "model": model, "avg_risk": avg}
+
+
+def allocation_commentary(alloc: dict, signals: dict) -> str:
+    """배분 결과 한글 설명 자동 생성."""
+    w = alloc["weights"]
+    cash = w.get("CASH", 0)
+    # 위험자산 비중 상위 2개
+    risk_sorted = sorted([(k, w[k]) for k in RISK_ASSETS if k in w],
+                         key=lambda x: x[1], reverse=True)
+    top = risk_sorted[:2]
+    parts = []
+    if cash >= 40:
+        parts.append(f"현재 환경에서는 위험자산 우호도가 낮아 현금 비중이 {cash}%로 높게 산정되었습니다.")
+    elif cash >= 20:
+        parts.append(f"현금 비중은 {cash}%로 중간 수준의 방어를 유지합니다.")
+    else:
+        parts.append(f"위험선호 환경이 우세해 현금 비중은 {cash}%로 낮게 산정되었습니다.")
+    if top:
+        names = ", ".join(f"{ASSET_KR[k].split(' (')[0]} {v}%" for k, v in top)
+        parts.append(f"위험자산 중에서는 환경 우호도가 높은 {names} 순으로 비중이 배정되었습니다.")
+    # 비트코인 코멘트(있으면)
+    if "BTC" in signals:
+        sg = signals["BTC"]
+        parts.append(f"비트코인은 환경상 {sg['stance']}으로 평가되어 {w.get('BTC',0)}% 배정되었습니다.")
+    return " ".join(parts)
 
 
 def biggest_changes(weekly_inputs: list) -> list:
@@ -1230,6 +1390,8 @@ def main():
         liq_trend = liquidity_trend(changes)
         cycle_full = economic_cycle_full(cycle, unrate, gdp)
         risk = risk_dashboard(vix_val, dxy_change, dgs10_val, hy_val)
+        # 현금/MMF 시그널 (위험자산 반대 + 단기금리). weather 계산 후에 추가.
+        signals["CASH"] = cash_signal(signals, rates.get("dgs2"), weather)
         ranking = asset_preference_ranking(signals)
 
         weekly_inputs = [
@@ -1246,6 +1408,9 @@ def main():
         ]
         top_changes = biggest_changes(weekly_inputs)
 
+        # 모델 포트폴리오 (3종)
+        allocations = {m: macro_allocation(signals, m) for m in ALLOC_MODELS}
+
     # ── 컨텍스트 묶음
     ctx = dict(
         period=period, errors=errors,
@@ -1258,14 +1423,18 @@ def main():
         vix=vix, vix_val=vix_val, hy=hy, hy_val=hy_val, unrate=unrate, gdp=gdp,
         gm2=gm2, weather=weather, liq_trend=liq_trend, cycle_full=cycle_full,
         risk=risk, ranking=ranking, top_changes=top_changes, dgs10_val=dgs10_val,
+        allocations=allocations,
     )
 
     # ── 탭 구성
-    tab1, tab2 = st.tabs(["📊 Market Overview", "🧠 Macro Intelligence"])
+    tab1, tab2, tab3 = st.tabs(
+        ["📊 Market Overview", "🧠 Macro Intelligence", "🧮 Model Allocation"])
     with tab1:
         render_market_overview(ctx)
     with tab2:
         render_macro_intelligence(ctx)
+    with tab3:
+        render_model_allocation(ctx)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1532,7 +1701,7 @@ def render_macro_intelligence(ctx: dict):
     # ── Section 6. Asset Environment
     st.markdown("#### 🎯 Asset Environment")
     st.caption("매수·매도 추천이 아니라, 거시 환경이 각 자산에 얼마나 우호적인지 보여줍니다.")
-    sig_keys = ["BTC", "QQQ", "SOXX", "GLD", "TLT"]
+    sig_keys = ["BTC", "QQQ", "SOXX", "GLD", "TLT", "CASH"]
     en_map = {"우호적": ("Favorable", C_GREEN), "중립": ("Neutral", C_YELLOW),
               "비우호적": ("Unfavorable", C_RED)}
     cf_map = {"높음": "High", "중간": "Medium", "낮음": "Low"}
@@ -1646,6 +1815,100 @@ def render_macro_intelligence(ctx: dict):
     st.markdown("---")
     st.caption("⚠️ Macro Intelligence는 거시 환경 해석 보조 도구입니다. 투자 추천이 아니며, "
                "금리·침체·글로벌 유동성 지표는 공개 데이터 기반의 근사·추정치를 포함합니다.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  탭 3) Model Allocation — 거시환경 기준 모델 포트폴리오 (투자자문 아님)
+# ═════════════════════════════════════════════════════════════════════════════
+ALLOC_COLORS = {
+    "CASH": "#64748b", "BTC": "#f7931a", "QQQ": "#38bdf8",
+    "SOXX": "#a78bfa", "GLD": "#eab308", "TLT": "#22c55e",
+}
+ALLOC_ORDER = ["CASH", "BTC", "QQQ", "SOXX", "GLD", "TLT"]
+
+
+def _alloc_bar(weights: dict) -> str:
+    """가로 스택 막대 HTML."""
+    segs = []
+    for k in ALLOC_ORDER:
+        w = weights.get(k, 0)
+        if w <= 0:
+            continue
+        nm = ASSET_KR[k].split(" (")[0]
+        segs.append(
+            f"<div style='width:{w}%;background:{ALLOC_COLORS[k]};display:flex;"
+            f"align-items:center;justify-content:center;font-size:11px;color:#0b0b0f;"
+            f"font-weight:700;' title='{nm} {w}%'>{w if w >= 8 else ''}</div>")
+    return ("<div style='display:flex;height:34px;border-radius:8px;overflow:hidden;"
+            "border:1px solid #2a2a35;'>" + "".join(segs) + "</div>")
+
+
+def _alloc_legend(weights: dict) -> str:
+    items = []
+    for k in ALLOC_ORDER:
+        w = weights.get(k, 0)
+        nm = ASSET_KR[k].split(" (")[0]
+        items.append(
+            f"<span style='display:inline-flex;align-items:center;gap:6px;margin:3px 10px 3px 0;font-size:13px;color:#cbd5e1;'>"
+            f"<span style='width:11px;height:11px;border-radius:3px;background:{ALLOC_COLORS[k]};display:inline-block;'></span>"
+            f"{nm} <b style='color:#f1f5f9;'>{w}%</b></span>")
+    return "<div style='margin-top:10px;'>" + "".join(items) + "</div>"
+
+
+def render_model_allocation(ctx: dict):
+    allocations = ctx["allocations"]; signals = ctx["signals"]
+    weather = ctx["weather"]; liq = ctx["liq"]
+
+    st.markdown("### 🧮 Macro Allocation Model")
+    st.caption("투자 추천·자문이 아닙니다. 현재 거시환경 점수를 바탕으로, 환경이 우호적인 "
+               "자산군을 상대적으로 높게 / 비우호적인 자산군을 낮게 환산한 모델 비중입니다. 총합 100%.")
+
+    # 현재 환경 한 줄
+    st.markdown(
+        f"<div style='font-size:14px;color:#94a3b8;margin-bottom:6px;'>"
+        f"현재 시장 환경: <b style='color:{weather['color']};'>{weather['emoji']} {weather['label']}</b>"
+        f" · 유동성 점수 {liq['score']}/100</div>", unsafe_allow_html=True)
+
+    # 기본(Balanced) 강조 표시
+    base = allocations["Balanced"]
+    st.markdown("#### 기준 모델 (Balanced)")
+    st.markdown(_alloc_bar(base["weights"]), unsafe_allow_html=True)
+    st.markdown(_alloc_legend(base["weights"]), unsafe_allow_html=True)
+    st.caption("🔎 " + allocation_commentary(base, signals))
+
+    st.divider()
+
+    # 3개 모델 나란히
+    st.markdown("#### 위험 성향별 3개 모델")
+    st.caption("동일한 환경 데이터를 기반으로 비중만 다르게 산출합니다.")
+    mcols = st.columns(3)
+    for i, mname in enumerate(["Conservative", "Balanced", "Aggressive"]):
+        alloc = allocations[mname]; meta = ALLOC_MODELS[mname]
+        with mcols[i]:
+            st.markdown(
+                f"<div style='font-size:16px;font-weight:800;color:#f1f5f9;'>{mname}"
+                f" <span style='font-size:13px;color:#94a3b8;'>({meta['kr']})</span></div>",
+                unsafe_allow_html=True)
+            st.markdown(_alloc_bar(alloc["weights"]), unsafe_allow_html=True)
+            # 표
+            rows = [{"자산": ASSET_KR[k].split(" (")[0], "비중": f"{alloc['weights'].get(k,0)}%"}
+                    for k in ALLOC_ORDER]
+            st.table(pd.DataFrame(rows))
+            st.caption(meta["desc"])
+
+    st.divider()
+
+    # 모델 비교 표
+    st.markdown("#### 모델 비교")
+    comp = {"자산": [ASSET_KR[k].split(" (")[0] for k in ALLOC_ORDER]}
+    for mname in ["Conservative", "Balanced", "Aggressive"]:
+        comp[mname] = [f"{allocations[mname]['weights'].get(k,0)}%" for k in ALLOC_ORDER]
+    st.table(pd.DataFrame(comp))
+
+    st.markdown("---")
+    st.caption("⚠️ 본 모델은 거시환경 데이터를 비중으로 환산한 교육·참고용 산출물입니다. "
+               "특정 종목의 매수·매도·보유를 권유하는 투자자문이 아니며, 실제 투자 결정과 "
+               "그 결과에 대한 책임은 전적으로 본인에게 있습니다.")
 
 
 if __name__ == "__main__":
