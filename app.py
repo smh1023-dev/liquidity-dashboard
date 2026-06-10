@@ -1281,6 +1281,11 @@ def main():
         st.header("⚙️ 설정")
         period = st.radio("차트 기간", list(PERIOD_DAYS.keys()), index=2)
         st.session_state["period"] = period
+        st.markdown("---")
+        seed_man = st.number_input("💰 시드 금액 (만원)", min_value=0, value=1000, step=100,
+                                   help="Model Allocation 탭에서 자산별 투자 금액을 계산합니다.")
+        seed = int(seed_man) * 10000  # 원 단위
+        st.caption(f"투자금: {seed:,}원")
         if st.button("🔄 데이터 새로고침"):
             st.cache_data.clear()
             st.rerun()
@@ -1411,6 +1416,19 @@ def main():
         # 모델 포트폴리오 (3종)
         allocations = {m: macro_allocation(signals, m) for m in ALLOC_MODELS}
 
+        # 자산별 현재가(USD) — 비트코인은 현물 ETF IBIT로
+        ibit = fetch_yfinance_data("IBIT")
+        ibit_px = float(ibit.dropna().iloc[-1]) if (ibit is not None and not ibit.dropna().empty) else None
+        prices_usd = {
+            "BTC": ibit_px,
+            "QQQ": etf_state.get("QQQ", {}).get("price"),
+            "SOXX": etf_state.get("SOXX", {}).get("price"),
+            "GLD": etf_state.get("GLD", {}).get("price"),
+            "TLT": etf_state.get("TLT", {}).get("price"),
+        }
+        krw = fetch_yfinance_data("KRW=X")
+        usd_krw = float(krw.dropna().iloc[-1]) if (krw is not None and not krw.dropna().empty) else None
+
     # ── 컨텍스트 묶음
     ctx = dict(
         period=period, errors=errors,
@@ -1423,7 +1441,8 @@ def main():
         vix=vix, vix_val=vix_val, hy=hy, hy_val=hy_val, unrate=unrate, gdp=gdp,
         gm2=gm2, weather=weather, liq_trend=liq_trend, cycle_full=cycle_full,
         risk=risk, ranking=ranking, top_changes=top_changes, dgs10_val=dgs10_val,
-        allocations=allocations,
+        allocations=allocations, seed=seed,
+        prices_usd=prices_usd, usd_krw=usd_krw,
     )
 
     # ── 탭 구성
@@ -1835,10 +1854,13 @@ def _alloc_bar(weights: dict) -> str:
         if w <= 0:
             continue
         nm = ASSET_KR[k].split(" (")[0]
+        # 좁은 칸도 숫자가 보이도록: 칸이 좁으면 글자만 작게
+        fsize = 11 if w >= 6 else 9
+        label = f"{w}" if w >= 3 else ""        # 3% 미만만 생략(너무 좁아 깨짐)
         segs.append(
             f"<div style='width:{w}%;background:{ALLOC_COLORS[k]};display:flex;"
-            f"align-items:center;justify-content:center;font-size:11px;color:#0b0b0f;"
-            f"font-weight:700;' title='{nm} {w}%'>{w if w >= 8 else ''}</div>")
+            f"align-items:center;justify-content:center;font-size:{fsize}px;color:#0b0b0f;"
+            f"font-weight:700;overflow:hidden;' title='{nm} {w}%'>{label}</div>")
     return ("<div style='display:flex;height:34px;border-radius:8px;overflow:hidden;"
             "border:1px solid #2a2a35;'>" + "".join(segs) + "</div>")
 
@@ -1855,21 +1877,85 @@ def _alloc_legend(weights: dict) -> str:
     return "<div style='margin-top:10px;'>" + "".join(items) + "</div>"
 
 
+def _alloc_amounts(weights: dict, seed: int) -> dict:
+    """비중(%) → 금액(원). 반올림 차액은 현금에서 보정해 합계=시드."""
+    amt = {k: int(round(seed * w / 100)) for k, w in weights.items()}
+    diff = seed - sum(amt.values())
+    if "CASH" in amt:
+        amt["CASH"] += diff
+    elif amt:
+        big = max(weights, key=weights.get)
+        amt[big] += diff
+    return amt
+
+
+# 자산 → 실제 매수 티커 (비트코인은 현물 ETF IBIT)
+ASSET_TICKER = {"BTC": "IBIT", "QQQ": "QQQ", "SOXX": "SOXX", "GLD": "GLD", "TLT": "TLT"}
+
+
+def alloc_shares(weights: dict, seed: int, prices_usd: dict, usd_krw: float | None) -> dict:
+    """
+    비중·시드·현재가로 ETF 정수 주식 수와 매수금액(원)을 계산.
+    정수 주 매수 후 남는 금액은 현금으로 합산(합계=시드).
+    반환: {asset: {shares, px_usd, px_krw, cost_krw}}, plus 'CASH' 금액.
+    """
+    out = {}
+    if not usd_krw or usd_krw <= 0:
+        return {"ok": False}
+    target = _alloc_amounts(weights, seed)   # 자산별 목표 금액(원)
+    cash_krw = target.get("CASH", 0)
+    for k in RISK_ASSETS:
+        budget = target.get(k, 0)
+        px_usd = prices_usd.get(k)
+        if not px_usd or px_usd <= 0:
+            out[k] = {"shares": 0, "px_usd": px_usd, "px_krw": None, "cost_krw": 0}
+            cash_krw += budget          # 가격 없으면 전액 현금 처리
+            continue
+        px_krw = px_usd * usd_krw
+        shares = int(budget // px_krw)  # 정수 주
+        cost = int(round(shares * px_krw))
+        leftover = budget - cost
+        cash_krw += leftover            # 남는 돈은 현금
+        out[k] = {"shares": shares, "px_usd": px_usd, "px_krw": px_krw, "cost_krw": cost}
+    out["CASH"] = {"cost_krw": int(round(cash_krw))}
+    out["ok"] = True
+    return out
+
+
+def _won(v: int) -> str:
+    """원 금액을 보기 좋게(억/만원) 표기."""
+    if v >= 100_000_000:
+        return f"{v/100_000_000:.2f}억원"
+    if v >= 10_000:
+        return f"{v/10_000:,.0f}만원"
+    return f"{v:,}원"
+
+
 def render_model_allocation(ctx: dict):
     allocations = ctx["allocations"]; signals = ctx["signals"]
-    weather = ctx["weather"]; liq = ctx["liq"]
+    weather = ctx["weather"]; liq = ctx["liq"]; seed = ctx.get("seed", 0)
+    prices_usd = ctx.get("prices_usd", {}); usd_krw = ctx.get("usd_krw")
 
     st.markdown("### 🧮 Macro Allocation Model")
     st.caption("투자 추천·자문이 아닙니다. 현재 거시환경 점수를 바탕으로, 환경이 우호적인 "
                "자산군을 상대적으로 높게 / 비우호적인 자산군을 낮게 환산한 모델 비중입니다. 총합 100%.")
 
-    # 현재 환경 한 줄
+    # 현재 환경 + 시드 한 줄
+    fx_txt = f" · 환율 {usd_krw:,.0f}원/$" if usd_krw else ""
     st.markdown(
         f"<div style='font-size:14px;color:#94a3b8;margin-bottom:6px;'>"
         f"현재 시장 환경: <b style='color:{weather['color']};'>{weather['emoji']} {weather['label']}</b>"
-        f" · 유동성 점수 {liq['score']}/100</div>", unsafe_allow_html=True)
+        f" · 유동성 점수 {liq['score']}/100"
+        + (f" · 투자금 <b style='color:#f1f5f9;'>{seed:,}원</b>" if seed > 0 else "")
+        + fx_txt + "</div>", unsafe_allow_html=True)
+    if seed <= 0:
+        st.caption("👈 사이드바에서 시드 금액을 입력하면 자산별 금액과 ETF 매수 주식 수가 함께 계산됩니다.")
+    can_shares = seed > 0 and bool(usd_krw)
 
-    # 기본(Balanced) 강조 표시
+    # 비트코인은 IBIT ETF
+    tk_label = {k: f"{ASSET_KR[k].split(' (')[0]} ({ASSET_TICKER[k]})" for k in RISK_ASSETS}
+
+    # 기준(Balanced)
     base = allocations["Balanced"]
     st.markdown("#### 기준 모델 (Balanced)")
     st.markdown(_alloc_bar(base["weights"]), unsafe_allow_html=True)
@@ -1878,32 +1964,57 @@ def render_model_allocation(ctx: dict):
 
     st.divider()
 
-    # 3개 모델 나란히
+    # 3개 모델 나란히 (비중 + 금액 + 주식수)
     st.markdown("#### 위험 성향별 3개 모델")
-    st.caption("동일한 환경 데이터를 기반으로 비중만 다르게 산출합니다.")
+    st.caption("동일한 환경 데이터를 기반으로 비중만 다르게 산출합니다."
+               + (" 금액·주식수는 시드와 현재가 기준으로 환산했습니다 (비트코인은 IBIT ETF)."
+                  if can_shares else
+                  (" 금액은 시드 기준으로 환산했습니다." if seed > 0 else "")))
     mcols = st.columns(3)
     for i, mname in enumerate(["Conservative", "Balanced", "Aggressive"]):
         alloc = allocations[mname]; meta = ALLOC_MODELS[mname]
+        amts = _alloc_amounts(alloc["weights"], seed) if seed > 0 else None
+        shr = alloc_shares(alloc["weights"], seed, prices_usd, usd_krw) if can_shares else None
         with mcols[i]:
             st.markdown(
                 f"<div style='font-size:16px;font-weight:800;color:#f1f5f9;'>{mname}"
                 f" <span style='font-size:13px;color:#94a3b8;'>({meta['kr']})</span></div>",
                 unsafe_allow_html=True)
             st.markdown(_alloc_bar(alloc["weights"]), unsafe_allow_html=True)
-            # 표
-            rows = [{"자산": ASSET_KR[k].split(" (")[0], "비중": f"{alloc['weights'].get(k,0)}%"}
-                    for k in ALLOC_ORDER]
+            rows = []
+            for k in ALLOC_ORDER:
+                name = tk_label[k] if k in RISK_ASSETS else ASSET_KR[k].split(" (")[0]
+                row = {"자산": name, "비중": f"{alloc['weights'].get(k,0)}%"}
+                if can_shares and shr and shr.get("ok"):
+                    if k == "CASH":
+                        row["주식수"] = "—"
+                        row["금액"] = _won(shr["CASH"]["cost_krw"])
+                    else:
+                        d = shr.get(k, {})
+                        row["주식수"] = f"{d.get('shares',0):,}주" if d.get("px_krw") else "가격없음"
+                        row["금액"] = _won(d.get("cost_krw", 0))
+                elif amts is not None:
+                    row["금액"] = _won(amts.get(k, 0))
+                rows.append(row)
             st.table(pd.DataFrame(rows))
             st.caption(meta["desc"])
 
     st.divider()
 
-    # 모델 비교 표
+    # 모델 비교 표 (비중 / 금액 선택)
     st.markdown("#### 모델 비교")
+    show_amt = seed > 0
     comp = {"자산": [ASSET_KR[k].split(" (")[0] for k in ALLOC_ORDER]}
     for mname in ["Conservative", "Balanced", "Aggressive"]:
-        comp[mname] = [f"{allocations[mname]['weights'].get(k,0)}%" for k in ALLOC_ORDER]
+        w = allocations[mname]["weights"]
+        if show_amt:
+            amts = _alloc_amounts(w, seed)
+            comp[mname] = [f"{w.get(k,0)}% · {_won(amts.get(k,0))}" for k in ALLOC_ORDER]
+        else:
+            comp[mname] = [f"{w.get(k,0)}%" for k in ALLOC_ORDER]
     st.table(pd.DataFrame(comp))
+    if show_amt:
+        st.caption(f"합계는 각 모델 모두 {seed:,}원입니다.")
 
     st.markdown("---")
     st.caption("⚠️ 본 모델은 거시환경 데이터를 비중으로 환산한 교육·참고용 산출물입니다. "
