@@ -92,6 +92,38 @@ BTC_DESC = ("비트코인의 장기 추세선입니다. 가격이 200일선 위�
 NETLIQ_DESC = ("Fed가 푼 돈에서 정부 통장과 Fed 주차장에 묶인 돈을 뺀 값입니다. "
                "실제 시장에 남아 있는 돈의 양을 보는 지표입니다.")
 
+# 추가: 대표 ETF 추세 (200일선) — 가격 추세 현황(거시 점수와 별개)
+ETFS = {
+    "QQQ": {
+        "kr": "미국 나스닥100 (QQQ)", "symbol": "QQQ", "ccy": "USD",
+        "desc": "미국 기술주 대표 지수입니다. 가격이 200일선 위면 상승 추세, 아래면 하락 추세로 봅니다.",
+    },
+    "SOXX": {
+        "kr": "미국 반도체 (SOXX)", "symbol": "SOXX", "ccy": "USD",
+        "desc": "미국 반도체 대표 지수입니다. 위험자산 심리의 선행 지표로 자주 쓰입니다. "
+                "200일선 위면 상승 추세입니다.",
+    },
+    "KODEX200": {
+        "kr": "한국 코스피200 (KODEX 200)", "symbol": "069500.KS", "ccy": "KRW",
+        "desc": "한국 증시 대표 지수입니다. 200일선 위면 상승 추세, 아래면 하락 추세로 봅니다.",
+    },
+    "GLD": {
+        "kr": "금 (GLD)", "symbol": "GLD", "ccy": "USD",
+        "desc": "금 가격을 따르는 대표 ETF입니다. 안전자산이자 인플레이션 방어 수단으로 봅니다. "
+                "200일선 위면 상승 추세입니다.",
+    },
+    "USO": {
+        "kr": "석유/원유 (USO)", "symbol": "USO", "ccy": "USD",
+        "desc": "WTI 원유 가격을 따르는 ETF입니다. 경기와 물가의 영향을 크게 받습니다. "
+                "200일선 위면 상승 추세입니다.",
+    },
+    "TLT": {
+        "kr": "미국 장기채 (TLT)", "symbol": "TLT", "ccy": "USD",
+        "desc": "미국 20년+ 국채 ETF입니다. 금리가 내리면 오르고, 금리가 오르면 내립니다. "
+                "200일선 위면 상승 추세입니다.",
+    },
+}
+
 # 차트 제목 (한글 별명 + 실제 지표명 병기)
 CHART_TITLES = {
     "WALCL": "연준 돈 수도꼭지 (Fed Balance Sheet)",
@@ -441,10 +473,10 @@ def _base_layout(fig: go.Figure, title: str, ytitle: str = ""):
     return fig
 
 
-def _empty_fig(title: str) -> go.Figure:
-    """데이터가 없을 때 '데이터 없음'을 표시하는 빈 차트."""
+def _empty_fig(title: str, msg: str = "데이터 없음 (새로고침 시 복구될 수 있음)") -> go.Figure:
+    """데이터가 없을 때 안내 문구를 표시하는 빈 차트."""
     fig = go.Figure()
-    fig.add_annotation(text="데이터 없음 (FRED 키 설정 또는 새로고침 필요)",
+    fig.add_annotation(text=msg,
                        xref="paper", yref="paper", x=0.5, y=0.5,
                        showarrow=False, font=dict(size=13, color="#94a3b8"))
     fig.update_xaxes(visible=False)
@@ -464,6 +496,24 @@ def plot_indicator_chart(s: pd.Series, title: str, period: str,
         fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
     ))
     return _base_layout(fig, title, ytitle)
+
+
+def plot_price_ma_chart(price: pd.Series, ma: pd.Series, title: str, period: str,
+                        ccy: str = "USD", name: str = "가격") -> go.Figure:
+    """가격 + 200일선 차트 (BTC·ETF 공용)."""
+    fig = go.Figure()
+    p = _slice_period(price, period) if price is not None else pd.Series(dtype=float)
+    m = _slice_period(ma, period) if ma is not None else pd.Series(dtype=float)
+    if (p is None or p.dropna().empty) and (m is None or m.dropna().empty):
+        return _empty_fig(title)
+    if p is not None and not p.empty:
+        fig.add_trace(go.Scatter(x=p.index, y=p.values, mode="lines",
+                                 name=name, line=dict(color=C_LINE, width=2)))
+    if m is not None and not m.empty:
+        fig.add_trace(go.Scatter(x=m.index, y=m.values, mode="lines",
+                                 name="200일선", line=dict(color=C_MA, width=2, dash="dash")))
+    fig.update_layout(showlegend=True, legend=dict(orientation="h", y=1.12, x=0))
+    return _base_layout(fig, title, ccy)
 
 
 def plot_btc_ma_chart(btc: pd.Series, ma: pd.Series, period: str) -> go.Figure:
@@ -562,6 +612,7 @@ def main():
     with st.sidebar:
         st.header("⚙️ 설정")
         period = st.radio("차트 기간", list(PERIOD_DAYS.keys()), index=2)
+        st.session_state["period"] = period
         if st.button("🔄 데이터 새로고침"):
             st.cache_data.clear()
             st.rerun()
@@ -611,6 +662,21 @@ def main():
 
         total, breakdown = calculate_score(changes, btc_above_ma, netliq_change)
         interp = generate_interpretation(total)
+
+        # 대표 ETF 200일선 추세 (거시 점수와 별개의 '추세 현황')
+        etf_state = {}
+        for key, meta in ETFS.items():
+            s = fetch_yfinance_data(meta["symbol"])
+            ma = compute_btc_ma(s, 200)  # 동일한 200일 이동평균 함수 재사용
+            if s.empty or ma.dropna().empty:
+                etf_state[key] = {"price": None, "ma": None, "above": None,
+                                  "series": s, "ma_series": ma}
+                errors.append(meta["kr"])
+            else:
+                price = float(s.iloc[-1]); ma_val = float(ma.dropna().iloc[-1])
+                etf_state[key] = {"price": price, "ma": ma_val,
+                                  "above": price > ma_val,
+                                  "series": s, "ma_series": ma}
 
     # ── 에러 안내(부분 실패해도 계속 진행)
     if errors:
@@ -702,6 +768,43 @@ def main():
     g7, g8 = st.columns(2)
     g7.plotly_chart(plot_btc_ma_chart(btc, btc_ma, period), use_container_width=True)
     g8.plotly_chart(plot_net_liquidity_chart(net, period), use_container_width=True)
+
+    # ── 대표 ETF 추세 (200일선)
+    st.markdown("### 📈 대표 ETF 추세 (200일선)")
+    st.caption("거시 유동성 점수와 별개로, 주요 지수의 가격 추세만 따로 보는 현황판입니다. "
+               "현재가가 200일선 위면 상승 추세로 봅니다.")
+
+    # 추세 요약 카드 (3개씩 줄바꿈)
+    etf_keys = list(ETFS.keys())
+    for row_start in range(0, len(etf_keys), 3):
+        ecols = st.columns(3)
+        for j, key in enumerate(etf_keys[row_start:row_start + 3]):
+            meta = ETFS[key]
+            stt = etf_state[key]
+            with ecols[j]:
+                above = stt["above"]
+                if above is None:
+                    status, emoji = "중립", "🟡"; cur = past = trend = "—"
+                else:
+                    status, emoji = ("긍정", "🟢") if above else ("부정", "🔴")
+                    trend = "상승 추세" if above else "하락 추세"
+                    if meta["ccy"] == "KRW":
+                        cur = f"₩{stt['price']:,.0f}"; past = f"200일선 ₩{stt['ma']:,.0f}"
+                    else:
+                        cur = f"${stt['price']:,.2f}"; past = f"200일선 ${stt['ma']:,.2f}"
+                render_card(meta["kr"], cur, past, trend, emoji, status, meta["desc"])
+
+    # 추세 차트 (3개씩 줄바꿈)
+    for row_start in range(0, len(etf_keys), 3):
+        fcols = st.columns(3)
+        for j, key in enumerate(etf_keys[row_start:row_start + 3]):
+            meta = ETFS[key]
+            stt = etf_state[key]
+            fcols[j].plotly_chart(
+                plot_price_ma_chart(stt["series"], stt["ma_series"], meta["kr"], period,
+                                    ccy=meta["ccy"], name=key),
+                use_container_width=True,
+            )
 
     # ── 점수 산정 내역
     with st.expander("🔎 점수 산정 내역 보기"):
