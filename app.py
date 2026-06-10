@@ -174,6 +174,28 @@ def _get_fred_api_key() -> str:
         return ""
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fred_diagnostics() -> dict:
+    """FRED 연결 상태 진단: 키 인식 여부 + API/CSV 응답 결과."""
+    key = _get_fred_api_key()
+    info = {"key_present": bool(key), "key_len": len(key) if key else 0,
+            "api": "미시도", "csv": "미시도"}
+    # API
+    if key:
+        try:
+            s = _fred_via_api("WALCL", START_DATE, key)
+            info["api"] = f"성공 ({len(s)}건)" if not s.empty else "빈 응답"
+        except Exception as e:
+            info["api"] = f"실패: {type(e).__name__}"
+    # CSV
+    try:
+        s = _fred_via_csv("WALCL", START_DATE)
+        info["csv"] = f"성공 ({len(s)}건)" if not s.empty else "빈 응답"
+    except Exception as e:
+        info["csv"] = f"실패: {type(e).__name__}"
+    return info
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_fred_data(series_id: str, start: str = START_DATE) -> pd.Series:
     """단일 FRED 시계열 수집 (다층 폴백). 실패 시 빈 Series."""
@@ -545,6 +567,11 @@ def main():
             st.rerun()
         st.markdown("---")
         st.caption("데이터: FRED(공개) · yfinance\n\n3개월 변화율 기준으로 점수를 계산합니다.")
+        with st.expander("🔧 FRED 연결 진단"):
+            d = fred_diagnostics()
+            st.write(f"- API 키 인식: {'✅ 있음(' + str(d['key_len']) + '자)' if d['key_present'] else '❌ 없음'}")
+            st.write(f"- 공식 API: {d['api']}")
+            st.write(f"- 공개 CSV: {d['csv']}")
 
     # ── 데이터 수집
     with st.spinner("거시 지표를 수집하는 중..."):
