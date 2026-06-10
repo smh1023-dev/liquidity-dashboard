@@ -610,7 +610,7 @@ ASSET_FACTORS = {
     "TLT":  {"liq": 0.15, "rate": 0.65, "dollar": 0.05, "trend": 0.15},
 }
 FACTOR_KR = {"liq": "유동성", "rate": "금리(완화)", "dollar": "달러(약세)", "trend": "200일선 추세"}
-ASSET_KR = {"BTC": "비트코인", "QQQ": "나스닥100(QQQ)", "SOXX": "반도체(SOXX)",
+ASSET_KR = {"BTC": "마이크로스트래티지(MSTR)", "QQQ": "나스닥100(QQQ)", "SOXX": "반도체(SOXX)",
             "GLD": "금(GLD)", "TLT": "장기채(TLT)", "CASH": "현금/MMF (Cash)"}
 
 
@@ -1087,7 +1087,8 @@ def allocation_commentary(alloc: dict, signals: dict) -> str:
     # 비트코인 코멘트(있으면)
     if "BTC" in signals:
         sg = signals["BTC"]
-        parts.append(f"비트코인은 환경상 {sg['stance']}으로 평가되어 {w.get('BTC',0)}% 배정되었습니다.")
+        btc_name = ASSET_KR.get("BTC", "비트코인").split("(")[0].strip()
+        parts.append(f"{btc_name}은(는) 환경상 {sg['stance']}으로 평가되어 {w.get('BTC',0)}% 배정되었습니다.")
     return " ".join(parts)
 
 
@@ -1416,11 +1417,11 @@ def main():
         # 모델 포트폴리오 (3종)
         allocations = {m: macro_allocation(signals, m) for m in ALLOC_MODELS}
 
-        # 자산별 현재가(USD) — 비트코인은 현물 ETF IBIT로
-        ibit = fetch_yfinance_data("IBIT")
-        ibit_px = float(ibit.dropna().iloc[-1]) if (ibit is not None and not ibit.dropna().empty) else None
+        # 자산별 현재가(USD) — 비트코인 대용으로 MSTR(마이크로스트래티지) 주식
+        btc_etf = fetch_yfinance_data("MSTR")
+        btc_etf_px = float(btc_etf.dropna().iloc[-1]) if (btc_etf is not None and not btc_etf.dropna().empty) else None
         prices_usd = {
-            "BTC": ibit_px,
+            "BTC": btc_etf_px,
             "QQQ": etf_state.get("QQQ", {}).get("price"),
             "SOXX": etf_state.get("SOXX", {}).get("price"),
             "GLD": etf_state.get("GLD", {}).get("price"),
@@ -1889,8 +1890,8 @@ def _alloc_amounts(weights: dict, seed: int) -> dict:
     return amt
 
 
-# 자산 → 실제 매수 티커 (비트코인은 현물 ETF IBIT)
-ASSET_TICKER = {"BTC": "IBIT", "QQQ": "QQQ", "SOXX": "SOXX", "GLD": "GLD", "TLT": "TLT"}
+# 자산 → 실제 매수 티커 (비트코인 대용 MSTR)
+ASSET_TICKER = {"BTC": "MSTR", "QQQ": "QQQ", "SOXX": "SOXX", "GLD": "GLD", "TLT": "TLT"}
 
 
 def alloc_shares(weights: dict, seed: int, prices_usd: dict, usd_krw: float | None) -> dict:
@@ -1952,8 +1953,8 @@ def render_model_allocation(ctx: dict):
         st.caption("👈 사이드바에서 시드 금액을 입력하면 자산별 금액과 ETF 매수 주식 수가 함께 계산됩니다.")
     can_shares = seed > 0 and bool(usd_krw)
 
-    # 비트코인은 IBIT ETF
-    tk_label = {k: f"{ASSET_KR[k].split(' (')[0]} ({ASSET_TICKER[k]})" for k in RISK_ASSETS}
+    # 비트코인 대용 MSTR
+    tk_label = {k: f"{ASSET_KR[k].split('(')[0].strip()} ({ASSET_TICKER[k]})" for k in RISK_ASSETS}
 
     # 기준(Balanced)
     base = allocations["Balanced"]
@@ -1967,7 +1968,7 @@ def render_model_allocation(ctx: dict):
     # 3개 모델 나란히 (비중 + 금액 + 주식수)
     st.markdown("#### 위험 성향별 3개 모델")
     st.caption("동일한 환경 데이터를 기반으로 비중만 다르게 산출합니다."
-               + (" 금액·주식수는 시드와 현재가 기준으로 환산했습니다 (비트코인은 IBIT ETF)."
+               + (" 금액·주식수는 시드와 현재가 기준으로 환산했습니다 (비트코인 대용 MSTR)."
                   if can_shares else
                   (" 금액은 시드 기준으로 환산했습니다." if seed > 0 else "")))
     mcols = st.columns(3)
